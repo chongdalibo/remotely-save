@@ -488,7 +488,11 @@ describe("Sync: getSyncPlanInplace holding back stale orphan files with no prevS
     assert.equal(result["orphan.md"].change, true);
   });
 
-  it("should hold a local-only file even when its mtime is after the last successful sync", async () => {
+  it("should still push a genuinely new file created after the last successful sync (regression guard)", async () => {
+    // this is the core regression this fix restores: a file whose mtime is
+    // "now" (after the last successful sync) is, in the overwhelming common
+    // case, just a brand-new note - it must not be held forever with no
+    // self-healing path just because this vault has synced before.
     const local = buildEntity(
       "new.md",
       lastSuccessSyncMillis + 60 * 1000, // created after the last sync completed
@@ -498,10 +502,7 @@ describe("Sync: getSyncPlanInplace holding back stale orphan files with no prevS
       "new.md": { key: "new.md", local },
     };
     const result = await runPlan(mapping, lastSuccessSyncMillis, false);
-    assert.equal(
-      result["new.md"].decision,
-      "local_is_created_but_looks_stale_then_hold"
-    );
+    assert.equal(result["new.md"].decision, "local_is_created_then_push");
   });
 
   it("should still upload new note-local .images attachments after the vault has synced before", async () => {
@@ -538,7 +539,7 @@ describe("Sync: getSyncPlanInplace holding back stale orphan files with no prevS
     const localImagesFolder = buildEntity("old-note/.images/", 0, 0);
     const localImage = buildEntity(
       "old-note/.images/foo.png",
-      lastSuccessSyncMillis + 60 * 1000,
+      lastSuccessSyncMillis - 60 * 60 * 1000, // genuinely stale, not a fresh attachment
       100
     );
     const mapping: Record<string, MixedEntity> = {
@@ -565,7 +566,7 @@ describe("Sync: getSyncPlanInplace holding back stale orphan files with no prevS
     const localFolder = buildEntity("old-folder/", 0, 0);
     const local = buildEntity(
       "old-folder/orphan.md",
-      lastSuccessSyncMillis + 60 * 1000,
+      lastSuccessSyncMillis - 60 * 60 * 1000, // genuinely stale orphan
       100
     );
     const mapping: Record<string, MixedEntity> = {
@@ -673,7 +674,7 @@ describe("Sync: getSyncPlanInplace holding back stale orphan files with no prevS
     const localFolder = buildEntity("old-large-folder/", 0, 0);
     const local = buildEntity(
       "old-large-folder/orphan.bin",
-      lastSuccessSyncMillis + 60 * 1000,
+      lastSuccessSyncMillis - 60 * 60 * 1000, // genuinely stale orphan
       10_000
     );
     const mapping: Record<string, MixedEntity> = {
@@ -739,20 +740,17 @@ describe("Sync: getSyncPlanInplace holding back stale orphan files with no prevS
     );
   });
 
-  it("should hold a local-only file whose mtime is only slightly before the last sync", async () => {
+  it("should not hold a file whose mtime is only slightly before the last sync (within the grace window)", async () => {
     const local = buildEntity(
       "recent.md",
-      lastSuccessSyncMillis - 60 * 1000,
+      lastSuccessSyncMillis - 60 * 1000, // 1 minute before, well within the 5-minute grace
       100
     );
     const mapping: Record<string, MixedEntity> = {
       "recent.md": { key: "recent.md", local },
     };
     const result = await runPlan(mapping, lastSuccessSyncMillis, false);
-    assert.equal(
-      result["recent.md"].decision,
-      "local_is_created_but_looks_stale_then_hold"
-    );
+    assert.equal(result["recent.md"].decision, "local_is_created_then_push");
   });
 
   it("should not hold anything when lastSuccessSyncMillis is unknown (true first sync)", async () => {
@@ -766,6 +764,43 @@ describe("Sync: getSyncPlanInplace holding back stale orphan files with no prevS
     };
     const result = await runPlan(mapping, undefined, false);
     assert.equal(result["orphan.md"].decision, "local_is_created_then_push");
+  });
+
+  it("should still create the shared parent folder when it holds one orphan but also contains a genuinely new file", async () => {
+    // regression guard: heldFolder must not take priority over keptFolder.
+    // Otherwise, fixing the file-level "always hold" regression above would
+    // just move the same bug one level up - the folder needed by a
+    // legitimate new file would get skipped just because a stale orphan
+    // elsewhere in the same folder marked it held.
+    const sharedFolder = buildEntity("shared/", 0, 0);
+    const orphan = buildEntity(
+      "shared/orphan.md",
+      lastSuccessSyncMillis - 60 * 60 * 1000, // genuinely stale
+      100
+    );
+    const freshNote = buildEntity(
+      "shared/new.md",
+      lastSuccessSyncMillis + 60 * 1000, // genuinely new
+      100
+    );
+    const mapping: Record<string, MixedEntity> = {
+      "shared/": { key: "shared/", local: sharedFolder },
+      "shared/orphan.md": { key: "shared/orphan.md", local: orphan },
+      "shared/new.md": { key: "shared/new.md", local: freshNote },
+    };
+    const result = await runPlan(mapping, lastSuccessSyncMillis, false);
+    assert.equal(
+      result["shared/orphan.md"].decision,
+      "local_is_created_but_looks_stale_then_hold"
+    );
+    assert.equal(
+      result["shared/new.md"].decision,
+      "local_is_created_then_push"
+    );
+    assert.equal(
+      result["shared/"].decision,
+      "folder_existed_local_then_also_create_remote"
+    );
   });
 });
 

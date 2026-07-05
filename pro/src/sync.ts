@@ -190,13 +190,26 @@ const hasRemoteNonAttachmentAncestorForDefaultDotAttachment = (
   return mixedEntityMappings[ancestorKey]?.remote !== undefined;
 };
 
+// Grace window subtracted from lastSuccessSyncMillis before comparing against
+// a local file's mtime: a sync round can legitimately take a while, so a file
+// created in the last few minutes of the previous round (and thus missed by
+// that round's local walk) shouldn't be treated as suspicious.
+const LAST_SUCCESS_SYNC_GRACE_MS = 5 * 60 * 1000;
+
 // If this vault has synced successfully before, a local-only file with no
 // prevSync record and no remote copy is ambiguous: it may be genuinely new, or
 // it may be an old offline path whose local sync history was cleared/lost after
-// another device deleted or renamed it. Path/mtime/size cannot prove which is
-// true, and mobile providers may rewrite mtimes while materializing files.
-// Holding it is the conservative choice: it prevents silent resurrection and
-// keeps the local file visible for manual recovery.
+// another device deleted or renamed it. Unlike the sibling "prevSync exists"
+// branch (where the file has necessarily survived a possibly-long offline
+// window and its mtime cannot be trusted - see the rename-ledger-or-hold
+// logic below), a file landing here for the first time is, in the overwhelming
+// common case, simply a brand-new note: its mtime is "now", regardless of how
+// long this device itself was offline before creating it. So mtime freshness
+// remains a reliable signal here even though it was deliberately dropped for
+// the "prevSync exists" branch. Treating every such file as suspicious (no
+// matter how recent) would permanently block ordinary new-file creation from
+// ever syncing, since a held decision here never establishes a prevSync
+// record - there is no self-healing retry.
 //
 // Deliberately NOT applied when this profile has zero prevSync records at
 // all AND no last-success timestamp at all: that is a true first sync for this
@@ -208,11 +221,12 @@ const hasRemoteNonAttachmentAncestorForDefaultDotAttachment = (
 // that folder at all is opt-in (syncConfigDir/syncBookmarks).
 const looksLikeUntrustedLocalOrphanRatherThanNew = (
   key: string,
+  local: Entity,
   configDir: string,
   lastSuccessSyncMillis: number | undefined,
   mixedEntityMappings: Record<string, MixedEntity>
 ): boolean => {
-  if (lastSuccessSyncMillis === undefined) {
+  if (lastSuccessSyncMillis === undefined || local.mtimeCli === undefined) {
     return false;
   }
   if (isInsideObsFolder(key, configDir)) {
@@ -227,12 +241,21 @@ const looksLikeUntrustedLocalOrphanRatherThanNew = (
   ) {
     return false;
   }
-  return true;
+  return local.mtimeCli < lastSuccessSyncMillis - LAST_SUCCESS_SYNC_GRACE_MS;
 };
 
 const shouldHoldLocalBecauseRemoteMissing = (key: string): boolean =>
   !key.endsWith("/");
 
+// Folders carry no mtime signal, so (unlike the file-level check above) this
+// stays conservative by default: skip recreating a local-only folder that
+// isn't otherwise needed. This does NOT block new content from syncing -
+// whenever a genuinely new file underneath is pushed (the file-level fix
+// above), that push already adds every ancestor folder to keptFolder, and
+// keptFolder now takes priority over this held/skip default (see the
+// heldFolder-vs-keptFolder ordering fix in the main loop), so the folder
+// still gets created. This only matters for folders that end up with no
+// legitimate content in them at all.
 const shouldSkipLocalOnlyFolderBecauseRemoteMissing = (
   key: string,
   configDir: string,
@@ -733,13 +756,12 @@ export const getSyncPlanInplace = async (
     if (key.endsWith("/")) {
       // folder
       // folder doesn't worry about mtime and size, only check their existences
-      if (heldFolder.has(key)) {
-        mixedEntry.decisionBranch = 141;
-        mixedEntry.decision = "folder_to_skip";
-        mixedEntry.change = false;
+      if (keptFolder.has(key)) {
+        // A folder that's needed for some legitimate content (push/pull/keep)
+        // must win even if it also contains held orphans elsewhere - otherwise
+        // the folder itself (and thus everything legitimately inside it) never
+        // gets created on the other side. Check this before heldFolder.
         heldFolder.delete(key);
-        keptFolder.delete(key);
-      } else if (keptFolder.has(key)) {
         // parent should also be kept
         // console.debug(`${key} in keptFolder`)
         keptFolder.add(getParentFolder(key));
@@ -783,6 +805,11 @@ export const getSyncPlanInplace = async (
           mixedEntry.change = true;
         }
         keptFolder.delete(key); // no need to save it in the Set later
+      } else if (heldFolder.has(key)) {
+        mixedEntry.decisionBranch = 141;
+        mixedEntry.decision = "folder_to_skip";
+        mixedEntry.change = false;
+        heldFolder.delete(key);
       } else {
         if (local !== undefined && remote !== undefined) {
           // both exist, do nothing
@@ -1298,14 +1325,14 @@ export const getSyncPlanInplace = async (
           } else if (
             looksLikeUntrustedLocalOrphanRatherThanNew(
               key,
+              local,
               configDir,
               lastSuccessSyncMillis,
               mixedEntityMappings
             )
           ) {
             mixedEntry.decisionBranch = 41;
-            mixedEntry.decision =
-              "local_is_created_but_looks_stale_then_hold";
+            mixedEntry.decision = "local_is_created_but_looks_stale_then_hold";
             // marked as a change (even though nothing is actually synced)
             // so it surfaces in the "export sync plan (only changes)" debug
             // tool instead of being silently filtered out.
@@ -1341,7 +1368,8 @@ export const getSyncPlanInplace = async (
             renameLedger,
             mixedEntityMappings
           );
-          const remoteDeleteOrRenameConfirmed = renameLedgerTarget !== undefined;
+          const remoteDeleteOrRenameConfirmed =
+            renameLedgerTarget !== undefined;
 
           if (remoteDeleteOrRenameConfirmed) {
             // The rename ledger deterministically confirms A was moved to a key
