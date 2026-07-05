@@ -2,7 +2,11 @@ import { strict as assert } from "assert";
 import moment from "moment";
 import type { MixedEntity, SyncDirectionType } from "../../src/baseTypes";
 import type { RenameLedger } from "../../src/renameLedger";
-import { checkIsSkipItemOrNotByName, getSyncPlanInplace } from "../src/sync";
+import {
+  checkIsSkipItemOrNotByName,
+  getSkipItemsByList,
+  getSyncPlanInplace,
+} from "../src/sync";
 
 // getSyncPlanInplace formats a timestamp via the Obsidian-injected window.moment
 // global at the very end; outside the Obsidian runtime we shim it for tests.
@@ -209,6 +213,152 @@ describe("Sync: checkIsSkipItemOrNotByName", () => {
     ).finalIsIgnored;
     assert.ok(isSkip);
   });
+
+  it("should sync note-local .images attachment folders without allowing other dot folders", async () => {
+    let isSkip = checkIsSkipItemOrNotByName(
+      ".images/foo.png",
+      false,
+      false,
+      false,
+      ".obsidian",
+      /* ignorePaths */ [],
+      /* onlyAllowPaths */ []
+    ).finalIsIgnored;
+    assert.ok(!isSkip);
+
+    isSkip = checkIsSkipItemOrNotByName(
+      "note/.images/foo.png",
+      false,
+      false,
+      false,
+      ".obsidian",
+      /* ignorePaths */ [],
+      /* onlyAllowPaths */ []
+    ).finalIsIgnored;
+    assert.ok(!isSkip);
+
+    for (const key of [
+      ".git/config",
+      ".trash/foo.md",
+      "note/.images/.secret/foo.png",
+      "note/.images/.git/config",
+    ]) {
+      isSkip = checkIsSkipItemOrNotByName(
+        key,
+        false,
+        false,
+        false,
+        ".obsidian",
+        /* ignorePaths */ [],
+        /* onlyAllowPaths */ []
+      ).finalIsIgnored;
+      assert.ok(isSkip, `${key} should still be hidden`);
+    }
+  });
+
+  it("should keep Obsidian config and plugin metadata skip rules stronger than .images attachment allowance", async () => {
+    let isSkip = checkIsSkipItemOrNotByName(
+      ".obsidian/plugins/foo/main.js",
+      false,
+      false,
+      false,
+      ".obsidian",
+      /* ignorePaths */ [],
+      /* onlyAllowPaths */ []
+    ).finalIsIgnored;
+    assert.ok(isSkip);
+
+    isSkip = checkIsSkipItemOrNotByName(
+      ".obsidian/bookmarks.json",
+      false,
+      true,
+      false,
+      ".obsidian",
+      /* ignorePaths */ [],
+      /* onlyAllowPaths */ []
+    ).finalIsIgnored;
+    assert.ok(!isSkip);
+
+    isSkip = checkIsSkipItemOrNotByName(
+      "_remotely-save-rename-ledger.json",
+      false,
+      false,
+      true,
+      ".obsidian",
+      /* ignorePaths */ [],
+      /* onlyAllowPaths */ []
+    ).finalIsIgnored;
+    assert.ok(isSkip);
+  });
+
+  it("should let ignore and allow lists override the default .images attachment allowance", async () => {
+    let isSkip = checkIsSkipItemOrNotByName(
+      "note/.images/foo.png",
+      false,
+      false,
+      false,
+      ".obsidian",
+      /* ignorePaths */ ["\\.images/"],
+      /* onlyAllowPaths */ []
+    ).finalIsIgnored;
+    assert.ok(isSkip);
+
+    isSkip = checkIsSkipItemOrNotByName(
+      "note/.images/foo.png",
+      false,
+      false,
+      false,
+      ".obsidian",
+      /* ignorePaths */ [],
+      /* onlyAllowPaths */ ["\\.md$"]
+    ).finalIsIgnored;
+    assert.ok(isSkip);
+
+    isSkip = checkIsSkipItemOrNotByName(
+      "note/.images/foo.png",
+      false,
+      false,
+      false,
+      ".obsidian",
+      /* ignorePaths */ [],
+      /* onlyAllowPaths */ ["note/\\.images/"]
+    ).finalIsIgnored;
+    assert.ok(!isSkip);
+  });
+
+  it("should not propagate hidden-folder skipping from .images parent folders to their children", async () => {
+    const skipOrNotResults = {
+      "note/": checkIsSkipItemOrNotByName(
+        "note/",
+        false,
+        false,
+        false,
+        ".obsidian",
+        [],
+        []
+      ),
+      "note/.images/": checkIsSkipItemOrNotByName(
+        "note/.images/",
+        false,
+        false,
+        false,
+        ".obsidian",
+        [],
+        []
+      ),
+      "note/.images/foo.png": checkIsSkipItemOrNotByName(
+        "note/.images/foo.png",
+        false,
+        false,
+        false,
+        ".obsidian",
+        [],
+        []
+      ),
+    };
+
+    assert.deepEqual(getSkipItemsByList(skipOrNotResults), []);
+  });
 });
 
 describe("Sync: getSyncPlanInplace mtime tolerance for offline-device delete/rename", () => {
@@ -216,10 +366,11 @@ describe("Sync: getSyncPlanInplace mtime tolerance for offline-device delete/ren
     ensureWindowMomentShim();
   });
 
-  it("should still delete locally when remote is gone and local mtime drifted a little bit (bug repro)", async () => {
-    // scenario: another device deleted the file on remote while this device was offline.
-    // this device's own local mtime for the untouched file drifts by a few hundred ms
-    // from what was recorded as prevSync (e.g. mobile fs stat precision quirks).
+  it("should hold locally when remote is gone and local mtime only drifted a little bit without a ledger entry", async () => {
+    // scenario: another device deleted or renamed the file on remote while this
+    // device was offline. A few hundred ms of stat drift is not strong enough
+    // evidence to delete the local copy, and uploading it would resurrect the
+    // old remote path.
     const prevSync = buildEntity("foo.md", 1_700_000_000_000, 100);
     const local = buildEntity("foo.md", 1_700_000_000_400, 100); // 400ms drift, same size
     const mapping: Record<string, MixedEntity> = {
@@ -228,7 +379,7 @@ describe("Sync: getSyncPlanInplace mtime tolerance for offline-device delete/ren
     const result = await runPlan(mapping);
     assert.equal(
       result["foo.md"].decision,
-      "remote_is_deleted_thus_also_delete_local"
+      "local_is_modified_but_remote_missing_then_hold"
     );
   });
 
@@ -245,14 +396,17 @@ describe("Sync: getSyncPlanInplace mtime tolerance for offline-device delete/ren
     );
   });
 
-  it("should still treat a genuinely resized local edit as modified, not swallow it, even with close mtime", async () => {
+  it("should hold a resized local file when remote is missing even with close mtime", async () => {
     const prevSync = buildEntity("foo.md", 1_700_000_000_000, 100);
     const local = buildEntity("foo.md", 1_700_000_000_400, 250); // content actually changed (size differs)
     const mapping: Record<string, MixedEntity> = {
       "foo.md": { key: "foo.md", local, prevSync },
     };
     const result = await runPlan(mapping);
-    assert.equal(result["foo.md"].decision, "local_is_modified_then_push");
+    assert.equal(
+      result["foo.md"].decision,
+      "local_is_modified_but_remote_missing_then_hold"
+    );
   });
 
   it("should hold a same-size local-only file with drifted mtime instead of resurrecting a possibly renamed/deleted remote path", async () => {
@@ -268,17 +422,20 @@ describe("Sync: getSyncPlanInplace mtime tolerance for offline-device delete/ren
     );
   });
 
-  it("should still push a clearly resized local edit when remote is missing", async () => {
+  it("should hold a resized local file when remote is missing instead of resurrecting the old path", async () => {
     const prevSync = buildEntity("foo.md", 1_700_000_000_000, 100);
     const local = buildEntity("foo.md", 1_700_000_060_000, 250);
     const mapping: Record<string, MixedEntity> = {
       "foo.md": { key: "foo.md", local, prevSync },
     };
     const result = await runPlan(mapping);
-    assert.equal(result["foo.md"].decision, "local_is_modified_then_push");
+    assert.equal(
+      result["foo.md"].decision,
+      "local_is_modified_but_remote_missing_then_hold"
+    );
   });
 
-  it("should correctly resolve a rename (old key deleted, new key created) even with mtime drift on the old key", async () => {
+  it("should hold the old key without a ledger even when a possible renamed-to key exists remotely", async () => {
     const oldPrevSync = buildEntity("old.md", 1_700_000_000_000, 100);
     const oldLocal = buildEntity("old.md", 1_700_000_000_400, 100); // untouched, just drifted
     const newRemote = buildEntity("new.md", 1_700_000_050_000, 100);
@@ -289,7 +446,7 @@ describe("Sync: getSyncPlanInplace mtime tolerance for offline-device delete/ren
     const result = await runPlan(mapping);
     assert.equal(
       result["old.md"].decision,
-      "remote_is_deleted_thus_also_delete_local"
+      "local_is_modified_but_remote_missing_then_hold"
     );
     assert.equal(result["new.md"].decision, "remote_is_created_then_pull");
   });
@@ -331,7 +488,7 @@ describe("Sync: getSyncPlanInplace holding back stale orphan files with no prevS
     assert.equal(result["orphan.md"].change, true);
   });
 
-  it("should still push a genuinely new file created after the last successful sync", async () => {
+  it("should hold a local-only file even when its mtime is after the last successful sync", async () => {
     const local = buildEntity(
       "new.md",
       lastSuccessSyncMillis + 60 * 1000, // created after the last sync completed
@@ -341,13 +498,212 @@ describe("Sync: getSyncPlanInplace holding back stale orphan files with no prevS
       "new.md": { key: "new.md", local },
     };
     const result = await runPlan(mapping, lastSuccessSyncMillis, false);
-    assert.equal(result["new.md"].decision, "local_is_created_then_push");
+    assert.equal(
+      result["new.md"].decision,
+      "local_is_created_but_looks_stale_then_hold"
+    );
   });
 
-  it("should not hold anything when this profile has no prevSync history at all (post reset-button / freshly switched profile)", async () => {
-    // same old mtime as the repro case, but treatAsFreshProfileSync=true
-    // (prevSyncEntityList.length === 0 for this sync round) must short-circuit
-    // the suspicion check entirely.
+  it("should still upload new note-local .images attachments after the vault has synced before", async () => {
+    const noteLocalFolder = buildEntity("note/", 0, 0);
+    const noteRemoteFolder = buildEntity("note/", 0, 0);
+    const localFolder = buildEntity("note/.images/", 0, 0);
+    const local = buildEntity(
+      "note/.images/foo.png",
+      lastSuccessSyncMillis + 60 * 1000,
+      100
+    );
+    const mapping: Record<string, MixedEntity> = {
+      "note/": {
+        key: "note/",
+        local: noteLocalFolder,
+        remote: noteRemoteFolder,
+      },
+      "note/.images/": { key: "note/.images/", local: localFolder },
+      "note/.images/foo.png": { key: "note/.images/foo.png", local },
+    };
+    const result = await runPlan(mapping, lastSuccessSyncMillis, false);
+    assert.equal(
+      result["note/.images/"].decision,
+      "folder_existed_local_then_also_create_remote"
+    );
+    assert.equal(
+      result["note/.images/foo.png"].decision,
+      "local_is_created_then_push"
+    );
+  });
+
+  it("should not resurrect a local-only old note folder just because it contains .images attachments", async () => {
+    const localNoteFolder = buildEntity("old-note/", 0, 0);
+    const localImagesFolder = buildEntity("old-note/.images/", 0, 0);
+    const localImage = buildEntity(
+      "old-note/.images/foo.png",
+      lastSuccessSyncMillis + 60 * 1000,
+      100
+    );
+    const mapping: Record<string, MixedEntity> = {
+      "old-note/": { key: "old-note/", local: localNoteFolder },
+      "old-note/.images/": {
+        key: "old-note/.images/",
+        local: localImagesFolder,
+      },
+      "old-note/.images/foo.png": {
+        key: "old-note/.images/foo.png",
+        local: localImage,
+      },
+    };
+    const result = await runPlan(mapping, lastSuccessSyncMillis, true);
+    assert.equal(result["old-note/"].decision, "folder_to_skip");
+    assert.equal(result["old-note/.images/"].decision, "folder_to_skip");
+    assert.equal(
+      result["old-note/.images/foo.png"].decision,
+      "local_is_created_but_looks_stale_then_hold"
+    );
+  });
+
+  it("should not recreate the old parent folder for a held local-only orphan", async () => {
+    const localFolder = buildEntity("old-folder/", 0, 0);
+    const local = buildEntity(
+      "old-folder/orphan.md",
+      lastSuccessSyncMillis + 60 * 1000,
+      100
+    );
+    const mapping: Record<string, MixedEntity> = {
+      "old-folder/": { key: "old-folder/", local: localFolder },
+      "old-folder/orphan.md": { key: "old-folder/orphan.md", local },
+    };
+    const result = await runPlan(mapping, lastSuccessSyncMillis, true);
+    assert.equal(
+      result["old-folder/orphan.md"].decision,
+      "local_is_created_but_looks_stale_then_hold"
+    );
+    assert.equal(result["old-folder/"].decision, "folder_to_skip");
+  });
+
+  it("should not recreate an empty local-only folder when the vault has synced before", async () => {
+    const localFolder = buildEntity("old-empty-folder/", 0, 0);
+    const mapping: Record<string, MixedEntity> = {
+      "old-empty-folder/": {
+        key: "old-empty-folder/",
+        local: localFolder,
+      },
+    };
+    const result = await runPlan(mapping, lastSuccessSyncMillis, true);
+    assert.equal(result["old-empty-folder/"].decision, "folder_to_skip");
+  });
+
+  it("should not delete a previously synced local-only folder without a ledger entry", async () => {
+    const prevSyncFolder = buildEntity("old-folder/", 0, 0);
+    const localFolder = buildEntity("old-folder/", 0, 0);
+    const mapping: Record<string, MixedEntity> = {
+      "old-folder/": {
+        key: "old-folder/",
+        local: localFolder,
+        prevSync: prevSyncFolder,
+      },
+    };
+    const result = await runPlan(
+      mapping,
+      lastSuccessSyncMillis,
+      false,
+      { version: "1", entries: [] },
+      "bidirectional"
+    );
+    assert.equal(result["old-folder/"].decision, "folder_to_skip");
+  });
+
+  it("should delete a previously synced local-only folder when the ledger target exists remotely", async () => {
+    const prevSyncFolder = buildEntity("old-folder/", 0, 0);
+    const localFolder = buildEntity("old-folder/", 0, 0);
+    const remoteNewFolder = buildEntity("new-folder/", 0, 0);
+    const renameLedger: RenameLedger = {
+      version: "1",
+      entries: [
+        {
+          fromKey: "old-folder",
+          toKey: "new-folder",
+          when: 1_700_000_010_000,
+        },
+      ],
+    };
+    const mapping: Record<string, MixedEntity> = {
+      "old-folder/": {
+        key: "old-folder/",
+        local: localFolder,
+        prevSync: prevSyncFolder,
+      },
+      "new-folder/": {
+        key: "new-folder/",
+        remote: remoteNewFolder,
+      },
+    };
+    const result = await runPlan(
+      mapping,
+      lastSuccessSyncMillis,
+      false,
+      renameLedger,
+      "bidirectional"
+    );
+    assert.equal(
+      result["old-folder/"].decision,
+      "folder_to_be_deleted_on_local"
+    );
+    assert.equal(
+      result["new-folder/"].decision,
+      "folder_existed_remote_then_also_create_local"
+    );
+  });
+
+  it("should still create a local-only folder on a true first sync", async () => {
+    const localFolder = buildEntity("new-folder/", 0, 0);
+    const mapping: Record<string, MixedEntity> = {
+      "new-folder/": {
+        key: "new-folder/",
+        local: localFolder,
+      },
+    };
+    const result = await runPlan(mapping, undefined, true);
+    assert.equal(
+      result["new-folder/"].decision,
+      "folder_existed_local_then_also_create_remote"
+    );
+  });
+
+  it("should hold an oversized local-only orphan before size filtering and not recreate its parent folder", async () => {
+    const localFolder = buildEntity("old-large-folder/", 0, 0);
+    const local = buildEntity(
+      "old-large-folder/orphan.bin",
+      lastSuccessSyncMillis + 60 * 1000,
+      10_000
+    );
+    const mapping: Record<string, MixedEntity> = {
+      "old-large-folder/": { key: "old-large-folder/", local: localFolder },
+      "old-large-folder/orphan.bin": {
+        key: "old-large-folder/orphan.bin",
+        local,
+      },
+    };
+    const result = await getSyncPlanInplace(
+      mapping,
+      /* skipSizeLargerThan */ 100,
+      /* conflictAction */ "keep_newer",
+      /* syncDirection */ "bidirectional",
+      /* profiler */ undefined,
+      /* settings */ {} as any,
+      /* triggerSource */ "manual",
+      /* configDir */ ".obsidian",
+      lastSuccessSyncMillis,
+      true,
+      { version: "1", entries: [] }
+    );
+    assert.equal(
+      result["old-large-folder/orphan.bin"].decision,
+      "local_is_created_but_looks_stale_then_hold"
+    );
+    assert.equal(result["old-large-folder/"].decision, "folder_to_skip");
+  });
+
+  it("should still hold after prevSync history was cleared if the vault has synced successfully before", async () => {
     const local = buildEntity(
       "orphan.md",
       lastSuccessSyncMillis - 60 * 60 * 1000,
@@ -357,7 +713,10 @@ describe("Sync: getSyncPlanInplace holding back stale orphan files with no prevS
       "orphan.md": { key: "orphan.md", local },
     };
     const result = await runPlan(mapping, lastSuccessSyncMillis, true);
-    assert.equal(result["orphan.md"].decision, "local_is_created_then_push");
+    assert.equal(
+      result["orphan.md"].decision,
+      "local_is_created_but_looks_stale_then_hold"
+    );
   });
 
   it("should not hold files inside the Obsidian config folder", async () => {
@@ -380,20 +739,23 @@ describe("Sync: getSyncPlanInplace holding back stale orphan files with no prevS
     );
   });
 
-  it("should not hold a file whose mtime is only slightly before the last sync (within the grace window)", async () => {
+  it("should hold a local-only file whose mtime is only slightly before the last sync", async () => {
     const local = buildEntity(
       "recent.md",
-      lastSuccessSyncMillis - 60 * 1000, // 1 minute before, well within the 5-minute grace
+      lastSuccessSyncMillis - 60 * 1000,
       100
     );
     const mapping: Record<string, MixedEntity> = {
       "recent.md": { key: "recent.md", local },
     };
     const result = await runPlan(mapping, lastSuccessSyncMillis, false);
-    assert.equal(result["recent.md"].decision, "local_is_created_then_push");
+    assert.equal(
+      result["recent.md"].decision,
+      "local_is_created_but_looks_stale_then_hold"
+    );
   });
 
-  it("should not hold anything when lastSuccessSyncMillis is unknown (e.g. never recorded before)", async () => {
+  it("should not hold anything when lastSuccessSyncMillis is unknown (true first sync)", async () => {
     const local = buildEntity(
       "orphan.md",
       lastSuccessSyncMillis - 60 * 60 * 1000,
@@ -419,6 +781,34 @@ describe("Sync: getSyncPlanInplace rename ledger overrides mtime-based guessing"
     // ledger says otherwise and must win.
     const prevSync = buildEntity("old.md", 1_700_000_000_000, 100);
     const local = buildEntity("old.md", 1_700_000_100_000, 100); // 100s later
+    const remoteNew = buildEntity("new.md", 1_700_000_050_000, 100);
+    const renameLedger: RenameLedger = {
+      version: "1",
+      entries: [
+        { fromKey: "old.md", toKey: "new.md", when: 1_700_000_010_000 },
+      ],
+    };
+    const mapping: Record<string, MixedEntity> = {
+      "old.md": { key: "old.md", local, prevSync },
+      "new.md": { key: "new.md", remote: remoteNew },
+    };
+    const result = await runPlan(
+      mapping,
+      undefined,
+      false,
+      renameLedger,
+      "bidirectional"
+    );
+    assert.equal(
+      result["old.md"].decision,
+      "remote_is_deleted_thus_also_delete_local"
+    );
+    assert.equal(result["new.md"].decision, "remote_is_created_then_pull");
+  });
+
+  it("trusts the ledger even when the stale old-path local file changed size while offline", async () => {
+    const prevSync = buildEntity("old.md", 1_700_000_000_000, 100);
+    const local = buildEntity("old.md", 1_700_000_100_000, 250);
     const remoteNew = buildEntity("new.md", 1_700_000_050_000, 100);
     const renameLedger: RenameLedger = {
       version: "1",
@@ -518,6 +908,33 @@ describe("Sync: getSyncPlanInplace rename ledger overrides mtime-based guessing"
     );
   });
 
+  it("should not recreate the old parent folder for a held previously synced file", async () => {
+    const prevSyncFolder = buildEntity("old-folder/", 0, 0);
+    const localFolder = buildEntity("old-folder/", 0, 0);
+    const prevSync = buildEntity("old-folder/old.md", 1_700_000_000_000, 100);
+    const local = buildEntity("old-folder/old.md", 1_700_000_100_000, 250);
+    const mapping: Record<string, MixedEntity> = {
+      "old-folder/": {
+        key: "old-folder/",
+        local: localFolder,
+        prevSync: prevSyncFolder,
+      },
+      "old-folder/old.md": { key: "old-folder/old.md", local, prevSync },
+    };
+    const result = await runPlan(
+      mapping,
+      undefined,
+      false,
+      { version: "1", entries: [] },
+      "bidirectional"
+    );
+    assert.equal(
+      result["old-folder/old.md"].decision,
+      "local_is_modified_but_remote_missing_then_hold"
+    );
+    assert.equal(result["old-folder/"].decision, "folder_to_skip");
+  });
+
   it("holds when the ledger's target doesn't exist anywhere and the old same-size local file only has mtime drift", async () => {
     const prevSync = buildEntity("old.md", 1_700_000_000_000, 100);
     const local = buildEntity("old.md", 1_700_000_100_000, 100);
@@ -569,7 +986,7 @@ describe("Sync: getSyncPlanInplace rename ledger overrides mtime-based guessing"
     assert.equal(result["old.md"].decision, "conflict_created_then_do_nothing");
   });
 
-  it("respects incremental_push_only direction: keeps local even when the ledger confirms a rename (push-only never deletes based on remote state)", async () => {
+  it("holds in incremental_push_only direction when the ledger confirms a rename, avoiding old-path resurrection", async () => {
     const prevSync = buildEntity("old.md", 1_700_000_000_000, 100);
     const local = buildEntity("old.md", 1_700_000_100_000, 100);
     const remoteNew = buildEntity("new.md", 1_700_000_050_000, 100);
@@ -590,7 +1007,10 @@ describe("Sync: getSyncPlanInplace rename ledger overrides mtime-based guessing"
       renameLedger,
       "incremental_push_only"
     );
-    assert.equal(result["old.md"].decision, "conflict_created_then_keep_local");
+    assert.equal(
+      result["old.md"].decision,
+      "local_is_modified_but_remote_missing_then_hold"
+    );
   });
 
   it("respects incremental_pull_and_delete_only direction: deletes local when the ledger confirms a rename", async () => {

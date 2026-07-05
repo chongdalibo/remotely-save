@@ -168,63 +168,94 @@ const isInsideObsFolder = (x: string, configDir: string) => {
   return x === configDir || x.startsWith(`${configDir}/`);
 };
 
-// Grace window subtracted from lastSuccessSyncMillis before comparing against
-// a local file's mtime: a sync round can legitimately take a while, so a file
-// created in the last few minutes of the previous round (and thus missed by
-// that round's local walk) shouldn't be treated as suspicious.
-const LAST_SUCCESS_SYNC_GRACE_MS = 5 * 60 * 1000;
+const DEFAULT_SYNCABLE_DOT_ATTACHMENT_DIRS = new Set([".images"]);
 
-// A genuinely-new local file's mtime can never predate the last time this
-// device finished a full successful sync for this profile - if it does, and
-// yet this device has no prevSync record for it and remote has nothing
-// either, something is off (most likely this device's own sync history for
-// that key was lost) rather than the file being freshly created. Holding it
-// (instead of pushing) turns a possible silent resurrection of a file
-// deleted/renamed elsewhere into a safe no-op, at the cost of not
-// auto-uploading a rare legitimately-old-but-freshly-added file.
+const isInsideDefaultSyncableDotAttachmentDir = (key: string) =>
+  key
+    .split("/")
+    .some((singlePart) => DEFAULT_SYNCABLE_DOT_ATTACHMENT_DIRS.has(singlePart));
+
+const hasRemoteNonAttachmentAncestorForDefaultDotAttachment = (
+  key: string,
+  mixedEntityMappings: Record<string, MixedEntity>
+): boolean => {
+  const parts = key.split("/");
+  const attachmentDirIndex = parts.findIndex((singlePart) =>
+    DEFAULT_SYNCABLE_DOT_ATTACHMENT_DIRS.has(singlePart)
+  );
+  if (attachmentDirIndex <= 0) {
+    return false;
+  }
+  const ancestorKey = `${parts.slice(0, attachmentDirIndex).join("/")}/`;
+  return mixedEntityMappings[ancestorKey]?.remote !== undefined;
+};
+
+// If this vault has synced successfully before, a local-only file with no
+// prevSync record and no remote copy is ambiguous: it may be genuinely new, or
+// it may be an old offline path whose local sync history was cleared/lost after
+// another device deleted or renamed it. Path/mtime/size cannot prove which is
+// true, and mobile providers may rewrite mtimes while materializing files.
+// Holding it is the conservative choice: it prevents silent resurrection and
+// keeps the local file visible for manual recovery.
 //
 // Deliberately NOT applied when this profile has zero prevSync records at
-// all (treatAsFreshProfileSync): that happens right after the user clicks
-// "clear sync records", or the first time a given remote profile is used, and
-// in both cases every local-only file legitimately looks "new" to this
-// profile - flagging them as suspicious there would misfire on the exact
-// recovery actions users take when something looks wrong.
+// all AND no last-success timestamp at all: that is a true first sync for this
+// vault/profile. If a last-success timestamp exists, the vault has synced
+// before, so a cleared prevSync table must not disable resurrection protection.
 //
 // Also skipped for files inside the Obsidian config folder: plugins/themes
 // are unpacked with their packaging mtime, which is often old, and syncing
 // that folder at all is opt-in (syncConfigDir/syncBookmarks).
-const looksLikeStaleOrphanRatherThanNew = (
+const looksLikeUntrustedLocalOrphanRatherThanNew = (
   key: string,
-  local: Entity,
   configDir: string,
   lastSuccessSyncMillis: number | undefined,
-  treatAsFreshProfileSync: boolean
+  mixedEntityMappings: Record<string, MixedEntity>
 ): boolean => {
-  if (treatAsFreshProfileSync) {
-    return false;
-  }
-  if (lastSuccessSyncMillis === undefined || local.mtimeCli === undefined) {
+  if (lastSuccessSyncMillis === undefined) {
     return false;
   }
   if (isInsideObsFolder(key, configDir)) {
     return false;
   }
-  return local.mtimeCli < lastSuccessSyncMillis - LAST_SUCCESS_SYNC_GRACE_MS;
+  if (
+    isInsideDefaultSyncableDotAttachmentDir(key) &&
+    hasRemoteNonAttachmentAncestorForDefaultDotAttachment(
+      key,
+      mixedEntityMappings
+    )
+  ) {
+    return false;
+  }
+  return true;
 };
 
-// When the remote side for a previously synced key has disappeared, a same-size
-// local copy with drifted mtime is weak evidence of a real edit and strong
-// evidence of an old path surviving on a long-offline device. Holding is safer
-// than re-uploading and silently recreating a deleted/renamed remote path.
-const looksLikeRemoteDeletedButLocalMTimeDrifted = (
+const shouldHoldLocalBecauseRemoteMissing = (key: string): boolean =>
+  !key.endsWith("/");
+
+const shouldSkipLocalOnlyFolderBecauseRemoteMissing = (
   key: string,
-  local: Entity,
-  prevSync: Entity
-): boolean =>
-  !key.endsWith("/") &&
-  local.sizeEnc !== undefined &&
-  prevSync.sizeEnc !== undefined &&
-  prevSync.sizeEnc === local.sizeEnc;
+  configDir: string,
+  lastSuccessSyncMillis: number | undefined,
+  mixedEntityMappings: Record<string, MixedEntity>
+): boolean => {
+  if (lastSuccessSyncMillis === undefined) {
+    return false;
+  }
+  if (isInsideObsFolder(key, configDir)) {
+    return false;
+  }
+  if (
+    isInsideDefaultSyncableDotAttachmentDir(key) &&
+    hasRemoteNonAttachmentAncestorForDefaultDotAttachment(
+      key,
+      mixedEntityMappings
+    )
+  ) {
+    return false;
+  }
+  return true;
+};
 
 const isBookmarksFile = (x: string, configDir: string) => {
   if (!configDir.startsWith(".")) {
@@ -235,6 +266,26 @@ const isBookmarksFile = (x: string, configDir: string) => {
     x === `${configDir}/` ||
     x === `${configDir}/bookmarks.json`
   );
+};
+
+// Obsidian vaults commonly keep note-local attachments in a dot-prefixed
+// folder such as `note/.images/foo.png`. Treat only that exact folder name as
+// syncable; every other dot-prefixed segment remains hidden, including nested
+// dot paths like `note/.images/.secret/foo`.
+const isHiddenDotPathExceptDefaultAttachmentDirs = (item: string) => {
+  const normalized = item.split("/");
+  for (const singlePart of normalized) {
+    if (singlePart === "." || singlePart === ".." || singlePart === "") {
+      continue;
+    }
+    if (
+      singlePart[0] === "." &&
+      !DEFAULT_SYNCABLE_DOT_ATTACHMENT_DIRS.has(singlePart)
+    ) {
+      return true;
+    }
+  }
+  return false;
 };
 
 interface IsSkipResult {
@@ -342,7 +393,7 @@ export const checkIsSkipItemOrNotByName = (
   }
 
   const checkIsHidden =
-    isHiddenPath(key, true, false) ||
+    isHiddenDotPathExceptDefaultAttachmentDirs(key) ||
     (!syncUnderscoreItems && isHiddenPath(key, false, true)) ||
     key === "/" ||
     key === DEFAULT_FILE_NAME_FOR_METADATAONREMOTE ||
@@ -659,6 +710,12 @@ export const getSyncPlanInplace = async (
   profiler?.insertSize("sizeof sortedKeys", sortedKeys);
 
   const keptFolder = new Set<string>();
+  const heldFolder = new Set<string>();
+  const markParentFoldersHeld = (key: string) => {
+    for (const folder of getFolderLevels(key, true)) {
+      heldFolder.add(folder);
+    }
+  };
 
   for (let i = 0; i < sortedKeys.length; ++i) {
     if (i % 100 === 0) {
@@ -676,7 +733,13 @@ export const getSyncPlanInplace = async (
     if (key.endsWith("/")) {
       // folder
       // folder doesn't worry about mtime and size, only check their existences
-      if (keptFolder.has(key)) {
+      if (heldFolder.has(key)) {
+        mixedEntry.decisionBranch = 141;
+        mixedEntry.decision = "folder_to_skip";
+        mixedEntry.change = false;
+        heldFolder.delete(key);
+        keptFolder.delete(key);
+      } else if (keptFolder.has(key)) {
         // parent should also be kept
         // console.debug(`${key} in keptFolder`)
         keptFolder.add(getParentFolder(key));
@@ -729,20 +792,28 @@ export const getSyncPlanInplace = async (
           keptFolder.add(getParentFolder(key));
         } else if (local !== undefined && remote === undefined) {
           if (prevSync !== undefined) {
-            // then the folder is deleted on remote
+            const renameLedgerTarget = resolveRenameLedgerTarget(
+              key,
+              renameLedger,
+              mixedEntityMappings
+            );
+            const remoteDeleteOrRenameConfirmed =
+              renameLedgerTarget !== undefined;
+
+            // A previously synced local folder whose remote folder is missing
+            // is ambiguous without rename-ledger evidence. Skipping is safer
+            // than deleting the local folder or recreating the old remote path.
             if (
               syncDirection === "incremental_push_only" ||
               syncDirection === "incremental_push_and_delete_only"
             ) {
               mixedEntry.decisionBranch = 122;
               mixedEntry.decision = "folder_to_skip";
-              keptFolder.add(getParentFolder(key));
               mixedEntry.change = false;
             } else if (syncDirection === "incremental_pull_only") {
               mixedEntry.decisionBranch = 123;
               mixedEntry.decision = "folder_to_skip";
               mixedEntry.change = false;
-              keptFolder.add(getParentFolder(key));
             } else if (syncDirection === "incremental_pull_and_delete_only") {
               if (
                 key === `${configDir}/` ||
@@ -753,6 +824,10 @@ export const getSyncPlanInplace = async (
                 mixedEntry.decision = "folder_existed_both_then_do_nothing";
                 mixedEntry.change = false;
                 keptFolder.add(getParentFolder(key));
+              } else if (!remoteDeleteOrRenameConfirmed) {
+                mixedEntry.decisionBranch = 144;
+                mixedEntry.decision = "folder_to_skip";
+                mixedEntry.change = false;
               } else {
                 mixedEntry.decisionBranch = 135;
                 mixedEntry.decision = "folder_to_be_deleted_on_local";
@@ -769,6 +844,10 @@ export const getSyncPlanInplace = async (
                 mixedEntry.decision = "folder_existed_both_then_do_nothing";
                 mixedEntry.change = false;
                 keptFolder.add(getParentFolder(key));
+              } else if (!remoteDeleteOrRenameConfirmed) {
+                mixedEntry.decisionBranch = 145;
+                mixedEntry.decision = "folder_to_skip";
+                mixedEntry.change = false;
               } else {
                 mixedEntry.decisionBranch = 124;
                 mixedEntry.decision = "folder_to_be_deleted_on_local";
@@ -782,11 +861,24 @@ export const getSyncPlanInplace = async (
               syncDirection === "incremental_push_only" ||
               syncDirection === "incremental_push_and_delete_only"
             ) {
-              mixedEntry.decisionBranch = 125;
-              mixedEntry.decision =
-                "folder_existed_local_then_also_create_remote";
-              mixedEntry.change = true;
-              keptFolder.add(getParentFolder(key));
+              if (
+                shouldSkipLocalOnlyFolderBecauseRemoteMissing(
+                  key,
+                  configDir,
+                  lastSuccessSyncMillis,
+                  mixedEntityMappings
+                )
+              ) {
+                mixedEntry.decisionBranch = 142;
+                mixedEntry.decision = "folder_to_skip";
+                mixedEntry.change = false;
+              } else {
+                mixedEntry.decisionBranch = 125;
+                mixedEntry.decision =
+                  "folder_existed_local_then_also_create_remote";
+                mixedEntry.change = true;
+                keptFolder.add(getParentFolder(key));
+              }
             } else if (
               syncDirection === "incremental_pull_only" ||
               syncDirection === "incremental_pull_and_delete_only"
@@ -797,11 +889,24 @@ export const getSyncPlanInplace = async (
               keptFolder.add(getParentFolder(key));
             } else {
               // bidirectional
-              mixedEntry.decisionBranch = 127;
-              mixedEntry.decision =
-                "folder_existed_local_then_also_create_remote";
-              mixedEntry.change = true;
-              keptFolder.add(getParentFolder(key));
+              if (
+                shouldSkipLocalOnlyFolderBecauseRemoteMissing(
+                  key,
+                  configDir,
+                  lastSuccessSyncMillis,
+                  mixedEntityMappings
+                )
+              ) {
+                mixedEntry.decisionBranch = 143;
+                mixedEntry.decision = "folder_to_skip";
+                mixedEntry.change = false;
+              } else {
+                mixedEntry.decisionBranch = 127;
+                mixedEntry.decision =
+                  "folder_existed_local_then_also_create_remote";
+                mixedEntry.change = true;
+                keptFolder.add(getParentFolder(key));
+              }
             }
           }
         } else if (local === undefined && remote !== undefined) {
@@ -1182,116 +1287,125 @@ export const getSyncPlanInplace = async (
 
         if (prevSync === undefined) {
           // if A is not in the previous list, A is new
-          if (skipSizeLargerThan <= 0 || local.sizeEnc! <= skipSizeLargerThan) {
+          if (
+            syncDirection === "incremental_pull_only" ||
+            syncDirection === "incremental_pull_and_delete_only"
+          ) {
+            mixedEntry.decisionBranch = 31;
+            mixedEntry.decision = "conflict_created_then_do_nothing";
+            mixedEntry.change = false;
+            keptFolder.add(getParentFolder(key));
+          } else if (
+            looksLikeUntrustedLocalOrphanRatherThanNew(
+              key,
+              configDir,
+              lastSuccessSyncMillis,
+              mixedEntityMappings
+            )
+          ) {
+            mixedEntry.decisionBranch = 41;
+            mixedEntry.decision =
+              "local_is_created_but_looks_stale_then_hold";
+            // marked as a change (even though nothing is actually synced)
+            // so it surfaces in the "export sync plan (only changes)" debug
+            // tool instead of being silently filtered out.
+            mixedEntry.change = true;
+            markParentFoldersHeld(key);
+            console.warn(
+              `remotely-save: holding back "${key}" instead of pushing it as new - ` +
+                `it has no prevSync record and no remote copy, but this vault ` +
+                `has synced successfully before, so it may be an orphaned ` +
+                `offline copy rather than a fresh local creation. ` +
+                `Export the sync plan for details.`
+            );
+          } else {
             if (
-              syncDirection === "incremental_pull_only" ||
-              syncDirection === "incremental_pull_and_delete_only"
+              skipSizeLargerThan <= 0 ||
+              local.sizeEnc! <= skipSizeLargerThan
             ) {
-              mixedEntry.decisionBranch = 31;
-              mixedEntry.decision = "conflict_created_then_do_nothing";
-              mixedEntry.change = false;
-              keptFolder.add(getParentFolder(key));
-            } else if (
-              looksLikeStaleOrphanRatherThanNew(
-                key,
-                local,
-                configDir,
-                lastSuccessSyncMillis,
-                treatAsFreshProfileSync
-              )
-            ) {
-              mixedEntry.decisionBranch = 41;
-              mixedEntry.decision =
-                "local_is_created_but_looks_stale_then_hold";
-              // marked as a change (even though nothing is actually synced)
-              // so it surfaces in the "export sync plan (only changes)" debug
-              // tool instead of being silently filtered out.
-              mixedEntry.change = true;
-              keptFolder.add(getParentFolder(key));
-              console.warn(
-                `remotely-save: holding back "${key}" instead of pushing it as new - ` +
-                  `it has no prevSync record and no remote copy, but its mtime ` +
-                  `predates this device's last successful sync, so it looks like ` +
-                  `an orphaned file rather than a fresh local creation. ` +
-                  `Export the sync plan for details.`
-              );
-            } else {
               mixedEntry.decisionBranch = 6;
               mixedEntry.decision = "local_is_created_then_push";
               mixedEntry.change = true;
               keptFolder.add(getParentFolder(key));
-            }
-          } else {
-            mixedEntry.decisionBranch = 37;
-            mixedEntry.decision = "local_is_created_too_large_then_do_nothing";
-            mixedEntry.change = false;
-            keptFolder.add(getParentFolder(key));
-          }
-        } else if (
-          resolveRenameLedgerTarget(key, renameLedger, mixedEntityMappings) !==
-            undefined ||
-          ((isSameMTimeWithinDeleteTolerance(
-            prevSync.mtimeSvr,
-            local.mtimeCli
-          ) ||
-            isSameMTimeWithinDeleteTolerance(
-              prevSync.mtimeCli,
-              local.mtimeCli
-            )) &&
-            prevSync.sizeEnc === local.sizeEnc)
-        ) {
-          // if A is in the previous list and UNMODIFIED, A has been deleted by B
-          // (or the rename ledger deterministically confirms A was moved to a
-          // key that still exists on remote - the destination key resolves
-          // this same sync round via its own, untouched "remote exists,
-          // local missing -> pull" branch, so together the two independently
-          // reached decisions add up to a correct local rename, without
-          // needing a dedicated rename decision type here.)
-          if (
-            syncDirection === "incremental_push_only" ||
-            syncDirection === "incremental_push_and_delete_only"
-          ) {
-            mixedEntry.decisionBranch = 32;
-            mixedEntry.decision = "conflict_created_then_keep_local";
-            mixedEntry.change = true;
-          } else if (syncDirection === "incremental_pull_only") {
-            mixedEntry.decisionBranch = 33;
-            mixedEntry.decision = "conflict_created_then_do_nothing";
-            mixedEntry.change = false;
-          } else if (syncDirection === "incremental_pull_and_delete_only") {
-            if (
-              key === `${configDir}/` ||
-              key === `${configDir}/bookmarks.json`
-            ) {
-              // special: never delete .obsidian/bookmarks.json file!
-              mixedEntry.decisionBranch = 139;
-              mixedEntry.decision = "conflict_created_then_keep_local";
-              mixedEntry.change = true;
-              keptFolder.add(getParentFolder(key));
             } else {
-              mixedEntry.decisionBranch = 39;
-              mixedEntry.decision = "remote_is_deleted_thus_also_delete_local";
-              mixedEntry.change = true;
-            }
-          } else {
-            if (
-              key === `${configDir}/` ||
-              key === `${configDir}/bookmarks.json`
-            ) {
-              // special: never delete .obsidian/bookmarks.json file!
-              mixedEntry.decisionBranch = 140;
-              mixedEntry.decision = "conflict_created_then_keep_local";
-              mixedEntry.change = true;
+              mixedEntry.decisionBranch = 37;
+              mixedEntry.decision =
+                "local_is_created_too_large_then_do_nothing";
+              mixedEntry.change = false;
               keptFolder.add(getParentFolder(key));
-            } else {
-              mixedEntry.decisionBranch = 7;
-              mixedEntry.decision = "remote_is_deleted_thus_also_delete_local";
-              mixedEntry.change = true;
             }
           }
         } else {
-          // if A is in the previous list and MODIFIED, A has been deleted by B but modified by A
-          if (skipSizeLargerThan <= 0 || local.sizeEnc! <= skipSizeLargerThan) {
+          const renameLedgerTarget = resolveRenameLedgerTarget(
+            key,
+            renameLedger,
+            mixedEntityMappings
+          );
+          const remoteDeleteOrRenameConfirmed = renameLedgerTarget !== undefined;
+
+          if (remoteDeleteOrRenameConfirmed) {
+            // The rename ledger deterministically confirms A was moved to a key
+            // that still exists on remote. The destination key resolves this
+            // same sync round via its own, untouched "remote exists, local
+            // missing -> pull" branch, so together the two independently
+            // reached decisions add up to a correct local rename, without
+            // needing a dedicated rename decision type here.
+            if (
+              syncDirection === "incremental_push_only" ||
+              syncDirection === "incremental_push_and_delete_only"
+            ) {
+              mixedEntry.decisionBranch = 43;
+              mixedEntry.decision =
+                "local_is_modified_but_remote_missing_then_hold";
+              mixedEntry.change = true;
+              markParentFoldersHeld(key);
+              console.warn(
+                `remotely-save: holding back "${key}" instead of uploading it ` +
+                  `in push-only mode - remote is missing for a previously synced ` +
+                  `path, so uploading would resurrect a file deleted or renamed ` +
+                  `elsewhere. Export the sync plan for details.`
+              );
+            } else if (syncDirection === "incremental_pull_only") {
+              mixedEntry.decisionBranch = 33;
+              mixedEntry.decision = "conflict_created_then_do_nothing";
+              mixedEntry.change = false;
+            } else if (syncDirection === "incremental_pull_and_delete_only") {
+              if (
+                key === `${configDir}/` ||
+                key === `${configDir}/bookmarks.json`
+              ) {
+                // special: never delete .obsidian/bookmarks.json file!
+                mixedEntry.decisionBranch = 139;
+                mixedEntry.decision = "conflict_created_then_keep_local";
+                mixedEntry.change = true;
+                keptFolder.add(getParentFolder(key));
+              } else {
+                mixedEntry.decisionBranch = 39;
+                mixedEntry.decision =
+                  "remote_is_deleted_thus_also_delete_local";
+                mixedEntry.change = true;
+              }
+            } else {
+              if (
+                key === `${configDir}/` ||
+                key === `${configDir}/bookmarks.json`
+              ) {
+                // special: never delete .obsidian/bookmarks.json file!
+                mixedEntry.decisionBranch = 140;
+                mixedEntry.decision = "conflict_created_then_keep_local";
+                mixedEntry.change = true;
+                keptFolder.add(getParentFolder(key));
+              } else {
+                mixedEntry.decisionBranch = 7;
+                mixedEntry.decision =
+                  "remote_is_deleted_thus_also_delete_local";
+                mixedEntry.change = true;
+              }
+            }
+          } else {
+            // if A is in the previous list and MODIFIED, A has been deleted by B but modified by A.
+            // Uploading it to the old key would resurrect a remote deletion/rename,
+            // so hold for manual review instead of guessing.
             if (
               syncDirection === "incremental_pull_only" ||
               syncDirection === "incremental_pull_and_delete_only"
@@ -1300,19 +1414,17 @@ export const getSyncPlanInplace = async (
               mixedEntry.decision = "conflict_created_then_do_nothing";
               mixedEntry.change = false;
               keptFolder.add(getParentFolder(key));
-            } else if (
-              looksLikeRemoteDeletedButLocalMTimeDrifted(key, local, prevSync)
-            ) {
+            } else if (shouldHoldLocalBecauseRemoteMissing(key)) {
               mixedEntry.decisionBranch = 42;
               mixedEntry.decision =
                 "local_is_modified_but_remote_missing_then_hold";
               mixedEntry.change = true;
-              keptFolder.add(getParentFolder(key));
+              markParentFoldersHeld(key);
               console.warn(
                 `remotely-save: holding back "${key}" instead of re-uploading it - ` +
-                  `remote is missing and the local file has the same size as the ` +
-                  `last sync record but a drifted mtime, so it may be an old ` +
-                  `offline copy of a file deleted or renamed elsewhere. ` +
+                  `remote is missing for a previously synced path, so it may ` +
+                  `be an old offline copy of a file deleted or renamed ` +
+                  `elsewhere. ` +
                   `Export the sync plan for details.`
               );
             } else {
@@ -1321,12 +1433,6 @@ export const getSyncPlanInplace = async (
               mixedEntry.change = true;
               keptFolder.add(getParentFolder(key));
             }
-          } else {
-            throw Error(
-              `local is modified (branch 8) but size larger than ${skipSizeLargerThan}, don't know what to do: ${JSON.stringify(
-                mixedEntry
-              )}`
-            );
           }
         }
       } else {
